@@ -35,6 +35,8 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
+#define TCA9548A_ADDR 0x70
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -54,7 +56,14 @@ UART_HandleTypeDef huart1;
 
 VL53L8CX_Configuration Dev;
 VL53L8CX_ResultsData Results;
+/* USER CODE BEGIN PV */
 
+VL53L8CX_Configuration Dev_Sensor1;  // Channel 0
+VL53L8CX_Configuration Dev_Sensor2;  // Channel 1
+VL53L8CX_ResultsData Results_Sensor1;
+VL53L8CX_ResultsData Results_Sensor2;
+
+/* USER CODE END PV */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -69,6 +78,15 @@ static void MX_I2C1_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+// Function to select multiplexer channel
+void SelectMuxChannel(uint8_t channel)
+{
+    uint8_t channel_byte = (1 << channel);  // Convert to bit mask
+    HAL_I2C_Master_Transmit(&hi2c1, 0x70 << 1, &channel_byte, 1, HAL_MAX_DELAY);
+    HAL_Delay(10);  // Give mux time to switch
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -132,71 +150,113 @@ int main(void)
   HAL_Delay(100);  // Wait for sensor to boot
 
 
-  Dev.platform.address = 0x52;
+  // TEST: Check if multiplexer responds
+  printf("Testing multiplexer at 0x70...\r\n");
+  HAL_StatusTypeDef mux_result = HAL_I2C_IsDeviceReady(&hi2c1, 0x70 << 1, 3, 1000);
+  printf("Multiplexer result: %d\r\n", mux_result);
 
+  if(mux_result != HAL_OK)
+  {
+      printf("ERROR: Multiplexer not detected!\r\n");
+      Error_Handler();
+  }
+
+  printf("--- Initializing Sensor 1 (Channel 0) ---\r\n");
+
+  SelectMuxChannel(0);  // Select channel 0
+
+  Dev_Sensor1.platform.address = 0x52;
+
+  // Test I2C
   HAL_StatusTypeDef i2c_result;
-  // Test if sensor responds on I2C bus
   i2c_result = HAL_I2C_IsDeviceReady(&hi2c1, 0x52, 3, 1000);
-  printf("HAL_I2C_IsDeviceReady result: %d\r\n", i2c_result);
-  printf("  (0=HAL_OK, 1=HAL_ERROR, 2=HAL_BUSY, 3=HAL_TIMEOUT)\r\n");
+  printf("Sensor 1 I2C result: %d\r\n", i2c_result);
 
   if(i2c_result != HAL_OK)
   {
-      printf("ERROR: I2C communication failed!\r\n");
-      printf("Check:\r\n");
-      printf("  1. Wiring (SDA, SCL)\r\n");
-      printf("  2. Pull-up resistors\r\n");
-      printf("  3. Power (PWR_EN = %d, LPn = %d)\r\n",
-             HAL_GPIO_ReadPin(PWR_EN_GPIO_Port, PWR_EN_Pin),
-             HAL_GPIO_ReadPin(VL53L8_LPn_GPIO_Port, VL53L8_LPn_Pin));
+      printf("ERROR: Sensor 1 not detected!\r\n");
+      Error_Handler();
   }
-  else
-  {
-      printf("SUCCESS: Sensor detected on I2C!\r\n");
-  }
+
   // Check if alive
   uint8_t isAlive, status;
-  status = vl53l8cx_is_alive(&Dev, &isAlive);
-  printf("is_alive status: %d, isAlive: %d\r\n", status, isAlive);
+  status = vl53l8cx_is_alive(&Dev_Sensor1, &isAlive);
+  printf("Sensor 1 is_alive: status=%d, alive=%d\r\n", status, isAlive);
+
   if(status != 0 || !isAlive)
   {
-      Error_Handler();  // Sensor not responding
+      printf("ERROR: Sensor 1 not alive!\r\n");
+      Error_Handler();
   }
 
-  // Initialize (uploads firmware)
-  printf("Starting init - this takes 1-2 seconds...\r\n");
-  HAL_UART_Transmit(&hcom_uart[COM1], (uint8_t*)"ASD", 20, HAL_MAX_DELAY);
-  fflush(stdout);  // Force output
-  status = vl53l8cx_init(&Dev);
-  printf("Init returned status: %d\r\n", status);
-  fflush(stdout);  // Force output
+  // Initialize sensor 1
+  printf("Initializing Sensor 1 (takes ~5 seconds)...\r\n");
+  status = vl53l8cx_init(&Dev_Sensor1);
+  printf("Sensor 1 init status: %d\r\n", status);
+
   if(status != 0)
   {
-	  printf("Init FAILED with status: %d\r\n", status);
-      Error_Handler();  // Init failed
+      printf("ERROR: Sensor 1 init failed!\r\n");
+      Error_Handler();
   }
 
-  printf("Init SUCCESS!\r\n");
+  // Configure sensor 1
+  vl53l8cx_set_resolution(&Dev_Sensor1, VL53L8CX_RESOLUTION_8X8);
+  vl53l8cx_set_ranging_frequency_hz(&Dev_Sensor1, 15);
+  vl53l8cx_start_ranging(&Dev_Sensor1);
 
-  // Configure
-  status = vl53l8cx_set_resolution(&Dev, VL53L8CX_RESOLUTION_8X8);
-  if(status != VL53L8CX_STATUS_OK)
+  printf("✓ Sensor 1 initialized and ranging!\r\n\r\n");
+
+  // ========================================
+  // Initialize Sensor 2 (Channel 1)
+  // ========================================
+  printf("--- Initializing Sensor 2 (Channel 1) ---\r\n");
+
+  SelectMuxChannel(1);  // Select channel 1
+
+  Dev_Sensor2.platform.address = 0x52;
+
+  // Test I2C
+  i2c_result = HAL_I2C_IsDeviceReady(&hi2c1, 0x52, 3, 1000);
+  printf("Sensor 2 I2C result: %d\r\n", i2c_result);
+
+  if(i2c_result != HAL_OK)
   {
-	  HAL_UART_Transmit(&hcom_uart[COM1], (uint8_t*)"Resolution not OK\r\n", 20, HAL_MAX_DELAY);
+      printf("ERROR: Sensor 2 not detected!\r\n");
+      Error_Handler();
   }
 
+  // Check if alive
+  status = vl53l8cx_is_alive(&Dev_Sensor2, &isAlive);
+  printf("Sensor 2 is_alive: status=%d, alive=%d\r\n", status, isAlive);
 
-  status = vl53l8cx_set_ranging_frequency_hz(&Dev, 15);
-  if(status != VL53L8CX_STATUS_OK)
+  if(status != 0 || !isAlive)
   {
-	  HAL_UART_Transmit(&hcom_uart[COM1], (uint8_t*)"Frequency not OK\r\n", 20, HAL_MAX_DELAY);
+      printf("ERROR: Sensor 2 not alive!\r\n");
+      Error_Handler();
   }
 
+  // Initialize sensor 2
+  printf("Initializing Sensor 2 (takes ~5 seconds)...\r\n");
+  status = vl53l8cx_init(&Dev_Sensor2);
+  printf("Sensor 2 init status: %d\r\n", status);
 
+  if(status != 0)
+  {
+      printf("ERROR: Sensor 2 init failed!\r\n");
+      Error_Handler();
+  }
 
-  // Start ranging
-  vl53l8cx_start_ranging(&Dev);
+  // Configure sensor 2
+  vl53l8cx_set_resolution(&Dev_Sensor2, VL53L8CX_RESOLUTION_8X8);
+  vl53l8cx_set_ranging_frequency_hz(&Dev_Sensor2, 15);
+  vl53l8cx_start_ranging(&Dev_Sensor2);
 
+  printf("✓ Sensor 2 initialized and ranging!\r\n\r\n");
+
+  printf("=== Both Sensors Ready! ===\r\n\r\n");
+
+  /* USER CODE END 2 */
   /* USER CODE END 2 */
 
   /* Initialize leds */
@@ -209,35 +269,181 @@ int main(void)
 
 
   /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
+ /* USER CODE BEGIN WHILE */
+
+  printf("\033[2J\033[H");  // Clear screen
+
   while (1)
   {
+      uint8_t isReady1, isReady2;
 
-	uint8_t isReady;
-	vl53l8cx_check_data_ready(&Dev, &isReady);
+      // Check Sensor 1 (Channel 0)
+      SelectMuxChannel(0);
+      vl53l8cx_check_data_ready(&Dev_Sensor1, &isReady1);
 
-	if(isReady)
-	{
-	    vl53l8cx_get_ranging_data(&Dev, &Results);
+      if(isReady1)
+      {
+          vl53l8cx_get_ranging_data(&Dev_Sensor1, &Results_Sensor1);
+      }
 
-	    printf("\r\n=== Distance Map (8x8) ===\r\n");
-	    for(int row = 0; row < 8; row++)
-	    {
-	        for(int col = 0; col < 8; col++)
-	        {
-	            int zone = row * 8 + col;
-	            printf("%4d ", Results.distance_mm[zone]);
-	        }
-	        printf("\r\n");
-	    }
-//	    printf("\r\n");
-	}
+      // Check Sensor 2 (Channel 1)
+      SelectMuxChannel(1);
+      vl53l8cx_check_data_ready(&Dev_Sensor2, &isReady2);
 
-	HAL_Delay(500);
+      if(isReady2)
+      {
+          vl53l8cx_get_ranging_data(&Dev_Sensor2, &Results_Sensor2);
+      }
 
-    /* USER CODE END WHILE */
+      // Display Both Sensors
+      if(isReady1 || isReady2)
+      {
+          printf("\033[H");  // Move cursor to top
 
-    /* USER CODE BEGIN 3 */
+          // Title
+          printf("╔════════════════════════════════════════════════════════════════════╗\r\n");
+          printf("║            VL53L8CX Dual Sensor System - 8x8 Mode                ║\r\n");
+          printf("╚════════════════════════════════════════════════════════════════════╝\r\n\r\n");
+
+          // ========================================
+          // SENSOR 1 Display
+          // ========================================
+          printf("┌─────────────────── SENSOR 1 (Channel 0) ────────────────────┐\r\n");
+          printf("│ Distance Map (mm):                                          │\r\n");
+          printf("├─────────────────────────────────────────────────────────────┤\r\n");
+
+          for(int row = 0; row < 8; row++)
+          {
+              printf("│ ");
+              for(int col = 0; col < 8; col++)
+              {
+                  int zone = row * 8 + col;
+
+                  if(Results_Sensor1.target_status[zone] == 5 ||
+                     Results_Sensor1.target_status[zone] == 9)
+                  {
+                      int dist = Results_Sensor1.distance_mm[zone];
+
+                      // Color coding
+                      if(dist < 300)
+                          printf("\033[41m %4d \033[0m", dist);      // Red background (very close)
+                      else if(dist < 600)
+                          printf("\033[31m %4d \033[0m", dist);      // Red text (close)
+                      else if(dist < 1000)
+                          printf("\033[33m %4d \033[0m", dist);      // Yellow (medium)
+                      else if(dist < 2000)
+                          printf("\033[32m %4d \033[0m", dist);      // Green (far)
+                      else
+                          printf("\033[36m %4d \033[0m", dist);      // Cyan (very far)
+                  }
+                  else
+                  {
+                      printf(" \033[90m---\033[0m ");  // Gray for invalid
+                  }
+              }
+              printf(" │\r\n");
+          }
+
+          // Sensor 1 stats
+          uint16_t min1 = 65535, max1 = 0, avg1 = 0;
+          int valid1 = 0;
+
+          for(int i = 0; i < 64; i++)
+          {
+              if(Results_Sensor1.target_status[i] == 5)
+              {
+                  int dist = Results_Sensor1.distance_mm[i];
+                  valid1++;
+                  avg1 += dist;
+                  if(dist < min1) min1 = dist;
+                  if(dist > max1) max1 = dist;
+              }
+          }
+          if(valid1 > 0) avg1 /= valid1;
+
+          printf("├─────────────────────────────────────────────────────────────┤\r\n");
+          printf("│ Min: \033[32m%4d mm\033[0m  Max: \033[36m%4d mm\033[0m  Avg: %4d mm  Valid: %2d/64 │\r\n",
+                 min1, max1, avg1, valid1);
+          printf("│ Temperature: %3d°C                                           │\r\n",
+                 Results_Sensor1.silicon_temp_degc);
+          printf("└─────────────────────────────────────────────────────────────┘\r\n\r\n");
+
+          // ========================================
+          // SENSOR 2 Display
+          // ========================================
+          printf("┌─────────────────── SENSOR 2 (Channel 1) ────────────────────┐\r\n");
+          printf("│ Distance Map (mm):                                          │\r\n");
+          printf("├─────────────────────────────────────────────────────────────┤\r\n");
+
+          for(int row = 0; row < 8; row++)
+          {
+              printf("│ ");
+              for(int col = 0; col < 8; col++)
+              {
+                  int zone = row * 8 + col;
+
+                  if(Results_Sensor2.target_status[zone] == 5 ||
+                     Results_Sensor2.target_status[zone] == 9)
+                  {
+                      int dist = Results_Sensor2.distance_mm[zone];
+
+                      // Color coding
+                      if(dist < 300)
+                          printf("\033[41m %4d \033[0m", dist);      // Red background
+                      else if(dist < 600)
+                          printf("\033[31m %4d \033[0m", dist);      // Red text
+                      else if(dist < 1000)
+                          printf("\033[33m %4d \033[0m", dist);      // Yellow
+                      else if(dist < 2000)
+                          printf("\033[32m %4d \033[0m", dist);      // Green
+                      else
+                          printf("\033[36m %4d \033[0m", dist);      // Cyan
+                  }
+                  else
+                  {
+                      printf(" \033[90m---\033[0m ");  // Gray
+                  }
+              }
+              printf(" │\r\n");
+          }
+
+          // Sensor 2 stats
+          uint16_t min2 = 65535, max2 = 0, avg2 = 0;
+          int valid2 = 0;
+
+          for(int i = 0; i < 64; i++)
+          {
+              if(Results_Sensor2.target_status[i] == 5)
+              {
+                  int dist = Results_Sensor2.distance_mm[i];
+                  valid2++;
+                  avg2 += dist;
+                  if(dist < min2) min2 = dist;
+                  if(dist > max2) max2 = dist;
+              }
+          }
+          if(valid2 > 0) avg2 /= valid2;
+
+          printf("├─────────────────────────────────────────────────────────────┤\r\n");
+          printf("│ Min: \033[32m%4d mm\033[0m  Max: \033[36m%4d mm\033[0m  Avg: %4d mm  Valid: %2d/64 │\r\n",
+                 min2, max2, avg2, valid2);
+          printf("│ Temperature: %3d°C                                           │\r\n",
+                 Results_Sensor2.silicon_temp_degc);
+          printf("└─────────────────────────────────────────────────────────────┘\r\n\r\n");
+
+          // Legend
+          printf("Legend: ");
+          printf("\033[41m VERY CLOSE \033[0m ");
+          printf("\033[31m CLOSE \033[0m ");
+          printf("\033[33m MEDIUM \033[0m ");
+          printf("\033[32m FAR \033[0m ");
+          printf("\033[36m VERY FAR \033[0m ");
+          printf("\033[90m INVALID \033[0m\r\n");
+
+          printf("                                                                    ");
+      }
+
+      HAL_Delay(50);
   }
   /* USER CODE END 3 */
 }
