@@ -35,6 +35,8 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
+#define TCA9548A_ADDR 0x70
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -48,7 +50,7 @@ COM_InitTypeDef BspCOMInit;
 
 I2C_HandleTypeDef hi2c1;
 
-UART_HandleTypeDef huart2;
+UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
 
@@ -61,8 +63,8 @@ VL53L8CX_ResultsData Results;
 void SystemClock_Config(void);
 static void MPU_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_USART1_UART_Init(void);
 static void MX_I2C1_Init(void);
-static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -103,9 +105,8 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_USART1_UART_Init();
   MX_I2C1_Init();
-  MX_USART2_UART_Init();
-
   /* USER CODE BEGIN 2 */
   /* Initialize COM1 port (115200, 8 bits (7-bit data + 1 stop bit), no parity */
    BspCOMInit.BaudRate   = 115200;
@@ -118,7 +119,7 @@ int main(void)
      Error_Handler();
    }
 
-
+  printf("Starting VL53L8CX initialization...\r\n");
   printf("Starting VL53L8CX init...\r\n");
 
   // Proper boot sequence
@@ -133,7 +134,36 @@ int main(void)
   HAL_Delay(100);  // Wait for sensor to boot
 
 
+  // TEST: Check if multiplexer responds
+  printf("Testing multiplexer at 0x70...\r\n");
+  HAL_StatusTypeDef mux_result = HAL_I2C_IsDeviceReady(&hi2c1, 0x70 << 1, 3, 1000);
+  printf("Multiplexer result: %d\r\n", mux_result);
+
+  if(mux_result != HAL_OK)
+  {
+      printf("ERROR: Multiplexer not detected!\r\n");
+      Error_Handler();
+  }
+
+  // Select channel 0 on multiplexer
+  printf("Selecting multiplexer channel 0...\r\n");
+  uint8_t channel = 0x01;  // Enable channel 0
+  HAL_I2C_Master_Transmit(&hi2c1, 0x70 << 1, &channel, 1, HAL_MAX_DELAY);
+
+  // NOW talk to the sensor at 0x52
   Dev.platform.address = 0x52;
+
+  HAL_StatusTypeDef i2c_result;
+  i2c_result = HAL_I2C_IsDeviceReady(&hi2c1, 0x52, 3, 1000);
+  printf("Sensor (through mux) result: %d\r\n", i2c_result);
+
+  if(i2c_result != HAL_OK)
+  {
+      printf("ERROR: Sensor not detected on channel 0!\r\n");
+      Error_Handler();
+  }
+
+  printf("SUCCESS: Sensor detected through multiplexer!\r\n");
 
   // Check if alive
   uint8_t isAlive, status;
@@ -148,7 +178,7 @@ int main(void)
   printf("Starting init - this takes 1-2 seconds...\r\n");
   HAL_UART_Transmit(&hcom_uart[COM1], (uint8_t*)"ASD", 20, HAL_MAX_DELAY);
   fflush(stdout);  // Force output
-  status = vl53l8cx_init(&Dev);
+  status = vl53l8cx_init(&Dev);  // Takes around 5seconds to initialize
   printf("Init returned status: %d\r\n", status);
   fflush(stdout);  // Force output
   if(status != 0)
@@ -160,7 +190,7 @@ int main(void)
   printf("Init SUCCESS!\r\n");
 
   // Configure
-  status = vl53l8cx_set_resolution(&Dev, VL53L8CX_RESOLUTION_4X4);
+  status = vl53l8cx_set_resolution(&Dev, VL53L8CX_RESOLUTION_8X8);
   if(status != VL53L8CX_STATUS_OK)
   {
 	  HAL_UART_Transmit(&hcom_uart[COM1], (uint8_t*)"Resolution not OK\r\n", 20, HAL_MAX_DELAY);
@@ -199,17 +229,22 @@ int main(void)
 
 	if(isReady)
 	{
-		vl53l8cx_get_ranging_data(&Dev, &Results);
+	    vl53l8cx_get_ranging_data(&Dev, &Results);
 
-		// Use data here
-		uint16_t distance = Results.distance_mm[0];  // Zone 0
-        // Send as formatted text
-        char msg[50];
-        sprintf(msg, "Dist: %u mm\r\n", distance);
-        HAL_UART_Transmit(&hcom_uart[COM1], (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+	    printf("\r\n=== Distance Map (8x8) ===\r\n");
+	    for(int row = 0; row < 8; row++)
+	    {
+	        for(int col = 0; col < 8; col++)
+	        {
+	            int zone = row * 8 + col;
+	            printf("%4d ", Results.distance_mm[zone]);
+	        }
+	        printf("\r\n");
+	    }
+//	    printf("\r\n");
 	}
 
-	HAL_Delay(50);
+	HAL_Delay(500);
 
     /* USER CODE END WHILE */
 
@@ -326,50 +361,50 @@ static void MX_I2C1_Init(void)
 }
 
 /**
-  * @brief USART2 Initialization Function
+  * @brief USART1 Initialization Function
   * @param None
   * @retval None
   */
-static void MX_USART2_UART_Init(void)
+static void MX_USART1_UART_Init(void)
 {
 
-  /* USER CODE BEGIN USART2_Init 0 */
+  /* USER CODE BEGIN USART1_Init 0 */
 
-  /* USER CODE END USART2_Init 0 */
+  /* USER CODE END USART1_Init 0 */
 
-  /* USER CODE BEGIN USART2_Init 1 */
+  /* USER CODE BEGIN USART1_Init 1 */
 
-  /* USER CODE END USART2_Init 1 */
-  huart2.Instance = USART2;
-  huart2.Init.BaudRate = 115200;
-  huart2.Init.WordLength = UART_WORDLENGTH_8B;
-  huart2.Init.StopBits = UART_STOPBITS_1;
-  huart2.Init.Parity = UART_PARITY_NONE;
-  huart2.Init.Mode = UART_MODE_TX_RX;
-  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
-  huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
-  huart2.Init.ClockPrescaler = UART_PRESCALER_DIV1;
-  huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-  if (HAL_UART_Init(&huart2) != HAL_OK)
+  /* USER CODE END USART1_Init 1 */
+  huart1.Instance = USART1;
+  huart1.Init.BaudRate = 115200;
+  huart1.Init.WordLength = UART_WORDLENGTH_8B;
+  huart1.Init.StopBits = UART_STOPBITS_1;
+  huart1.Init.Parity = UART_PARITY_NONE;
+  huart1.Init.Mode = UART_MODE_TX_RX;
+  huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart1.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart1) != HAL_OK)
   {
     Error_Handler();
   }
-  if (HAL_UARTEx_SetTxFifoThreshold(&huart2, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart1, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
   {
     Error_Handler();
   }
-  if (HAL_UARTEx_SetRxFifoThreshold(&huart2, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart1, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
   {
     Error_Handler();
   }
-  if (HAL_UARTEx_DisableFifoMode(&huart2) != HAL_OK)
+  if (HAL_UARTEx_DisableFifoMode(&huart1) != HAL_OK)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN USART2_Init 2 */
+  /* USER CODE BEGIN USART1_Init 2 */
 
-  /* USER CODE END USART2_Init 2 */
+  /* USER CODE END USART1_Init 2 */
 
 }
 
@@ -388,7 +423,6 @@ static void MX_GPIO_Init(void)
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
-  __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
