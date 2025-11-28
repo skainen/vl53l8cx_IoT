@@ -2,7 +2,7 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Main program body - 6 Sensor Configuration
+  * @brief          : Main program body - Single Sensor Visualization (Sensor 3)
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -27,6 +27,7 @@
 
 #define TCA9548A_ADDR 0x70
 #define NUM_SENSORS 6
+#define DEMO_SENSOR 2  // Sensor 3 (index 2)
 
 /* USER CODE END PD */
 
@@ -122,33 +123,52 @@ uint8_t InitializeSensor(uint8_t sensor_num, uint8_t channel)
     return 0;
 }
 
-// Calculate sensor statistics
-void CalculateSensorStats(uint8_t sensor_num, uint16_t *min, uint16_t *max, uint16_t *avg, uint8_t *valid)
+// Get color code and block character based on distance
+void GetDistanceDisplay(uint16_t dist_mm, char* color, char* block)
 {
-    *min = 65535;
-    *max = 0;
-    *avg = 0;
-    *valid = 0;
-
-    for(int i = 0; i < 64; i++)
-    {
-        if(Results_Sensors[sensor_num].target_status[i] == 5 ||
-           Results_Sensors[sensor_num].target_status[i] == 9)
-        {
-            uint16_t dist = Results_Sensors[sensor_num].distance_mm[i];
-            (*valid)++;
-            *avg += dist;
-            if(dist < *min) *min = dist;
-            if(dist > *max) *max = dist;
-        }
+    if(dist_mm < 300) {
+        strcpy(color, "\033[41;97m");  // Red background, white text
+        strcpy(block, "██");
     }
-
-    if(*valid > 0)
-        *avg /= *valid;
-    else
-        *min = 0;
+    else if(dist_mm < 600) {
+        strcpy(color, "\033[31;1m");   // Bright red
+        strcpy(block, "▓▓");
+    }
+    else if(dist_mm < 1000) {
+        strcpy(color, "\033[33;1m");   // Bright yellow
+        strcpy(block, "▒▒");
+    }
+    else if(dist_mm < 2000) {
+        strcpy(color, "\033[32m");     // Green
+        strcpy(block, "░░");
+    }
+    else {
+        strcpy(color, "\033[36m");     // Cyan
+        strcpy(block, "··");
+    }
 }
 
+
+void DisplaySensorData(void)
+{
+    for(int i = 0; i < NUM_SENSORS; i++)
+    {
+        uint16_t min_dist = 65535;
+
+        // Find minimum distance
+        for(int j = 0; j < 64; j++)
+        {
+            if(Results_Sensors[i].target_status[j] == 5)
+            {
+                uint16_t dist = Results_Sensors[i].distance_mm[j];
+                if(dist < min_dist)
+                    min_dist = dist;
+            }
+        }
+
+        printf("%d,%d\r\n", i+1, min_dist);
+    }
+}
 /* USER CODE END 0 */
 
 /**
@@ -185,7 +205,6 @@ int main(void)
   MX_GPIO_Init();
   MX_USART1_UART_Init();
   MX_I2C1_Init();
-
   /* USER CODE BEGIN 2 */
 
   /* Initialize COM1 port */
@@ -198,13 +217,6 @@ int main(void)
   {
     Error_Handler();
   }
-
-  printf("\r\n\r\n");
-  printf("========================================\r\n");
-  printf("  VL53L8CX 6-Sensor System Startup\r\n");
-  printf("========================================\r\n\r\n");
-
-  // Power up sequence
   HAL_GPIO_WritePin(PWR_EN_GPIO_Port, PWR_EN_Pin, GPIO_PIN_SET);
   HAL_Delay(10);
 
@@ -214,13 +226,10 @@ int main(void)
   HAL_Delay(100);
 
   // Test multiplexer
-  printf("Testing multiplexer at 0x70...\r\n");
   HAL_StatusTypeDef mux_result = HAL_I2C_IsDeviceReady(&hi2c1, TCA9548A_ADDR << 1, 3, 1000);
-  printf("Multiplexer result: %d\r\n\r\n", mux_result);
 
   if(mux_result != HAL_OK)
   {
-      printf("ERROR: Multiplexer not detected!\r\n");
       Error_Handler();
   }
 
@@ -229,16 +238,9 @@ int main(void)
   {
       if(InitializeSensor(i, i) != 0)
       {
-          printf("FATAL: Sensor %d initialization failed!\r\n", i + 1);
           Error_Handler();
       }
   }
-
-  printf("========================================\r\n");
-  printf("  All Sensors Ready - Starting Ranging\r\n");
-  printf("========================================\r\n\r\n");
-
-  HAL_Delay(1000);
 
   /* USER CODE END 2 */
 
@@ -247,103 +249,47 @@ int main(void)
   BSP_LED_Init(LED_YELLOW);
   BSP_LED_Init(LED_RED);
 
-  /* Initialize USER push-button */
+  /* Initialize USER push-button, will be used to trigger an interrupt each time it's pressed.*/
   BSP_PB_Init(BUTTON_USER, BUTTON_MODE_EXTI);
+
+  /* Initialize COM1 port (115200, 8 bits (7-bit data + 1 stop bit), no parity */
+  BspCOMInit.BaudRate   = 115200;
+  BspCOMInit.WordLength = COM_WORDLENGTH_8B;
+  BspCOMInit.StopBits   = COM_STOPBITS_1;
+  BspCOMInit.Parity     = COM_PARITY_NONE;
+  BspCOMInit.HwFlowCtl  = COM_HWCONTROL_NONE;
+  if (BSP_COM_Init(COM1, &BspCOMInit) != BSP_ERROR_NONE)
+  {
+    Error_Handler();
+  }
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
 
-  uint32_t frame_count = 0;
-
   while (1)
   {
-      uint8_t data_ready[NUM_SENSORS] = {0};
+      uint8_t any_ready = 0;
 
-      // Check all sensors for new data
+      // Check all sensors
       for(int i = 0; i < NUM_SENSORS; i++)
       {
           SelectMuxChannel(i);
-          vl53l8cx_check_data_ready(&Dev_Sensors[i], &data_ready[i]);
+          uint8_t data_ready;
+          vl53l8cx_check_data_ready(&Dev_Sensors[i], &data_ready);
 
-          if(data_ready[i])
+          if(data_ready)
           {
               vl53l8cx_get_ranging_data(&Dev_Sensors[i], &Results_Sensors[i]);
+              any_ready = 1;
           }
-      }
-
-      // Display if any sensor has new data
-      uint8_t any_ready = 0;
-      for(int i = 0; i < NUM_SENSORS; i++)
-      {
-          if(data_ready[i]) any_ready = 1;
       }
 
       if(any_ready)
       {
-          frame_count++;
-
-          printf("\033[2J\033[H");  // Clear screen and home cursor
-
-          printf("================================================================================\r\n");
-          printf("  VL53L8CX 6-Sensor System | Frame: %lu\r\n", frame_count);
-          printf("================================================================================\r\n\r\n");
-
-          printf("Sensor | Min(mm) | Max(mm) | Avg(mm) | Valid Zones | Temp(C) | Status\r\n");
-          printf("-------+---------+---------+---------+-------------+---------+--------\r\n");
-
-          for(int i = 0; i < NUM_SENSORS; i++)
-          {
-              uint16_t min, max, avg;
-              uint8_t valid;
-
-              CalculateSensorStats(i, &min, &max, &avg, &valid);
-
-              printf("   %d   |  %5d  |  %5d  |  %5d  |    %2d/64    |   %3d   | %s\r\n",
-                     i + 1,
-                     min,
-                     max,
-                     avg,
-                     valid,
-                     Results_Sensors[i].silicon_temp_degc,
-                     data_ready[i] ? "OK" : "--");
-          }
-
-          printf("\r\n");
-          printf("Detailed View (minimum distance per sensor):\r\n");
-          printf("-----------------------------------------------------------------------\r\n");
-
-          for(int i = 0; i < NUM_SENSORS; i++)
-          {
-              uint16_t min, max, avg;
-              uint8_t valid;
-
-              CalculateSensorStats(i, &min, &max, &avg, &valid);
-
-              // Visual bar representation
-              printf("S%d: [", i + 1);
-
-              int bar_length = (min < 4000) ? (40 - (min / 100)) : 0;
-              if(bar_length < 0) bar_length = 0;
-              if(bar_length > 40) bar_length = 40;
-
-              for(int j = 0; j < bar_length; j++)
-              {
-                  printf("=");
-              }
-              for(int j = bar_length; j < 40; j++)
-              {
-                  printf(" ");
-              }
-
-              printf("] %4dmm\r\n", min);
-          }
-
-          printf("\r\n");
+          DisplaySensorData();
       }
 
-      HAL_Delay(50);
-
-    /* USER CODE END WHILE */
+      HAL_Delay(10);
   }
   /* USER CODE END 3 */
 }
@@ -517,28 +463,18 @@ static void MX_GPIO_Init(void)
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOC_CLK_ENABLE();
-  __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOC, VL53L8_LPn_Pin|GPIO_PIN_3, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOC, VL53L8_LPn_Pin|PWR_EN_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(PWR_EN_GPIO_Port, PWR_EN_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pins : VL53L8_LPn_Pin PC3 */
-  GPIO_InitStruct.Pin = VL53L8_LPn_Pin|GPIO_PIN_3;
+  /*Configure GPIO pins : VL53L8_LPn_Pin PWR_EN_Pin */
+  GPIO_InitStruct.Pin = VL53L8_LPn_Pin|PWR_EN_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : PWR_EN_Pin */
-  GPIO_InitStruct.Pin = PWR_EN_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(PWR_EN_GPIO_Port, &GPIO_InitStruct);
 
   /*AnalogSwitch Config */
   HAL_SYSCFG_AnalogSwitchConfig(SYSCFG_SWITCH_PC3, SYSCFG_SWITCH_PC3_CLOSE);
@@ -594,7 +530,6 @@ void Error_Handler(void)
   }
   /* USER CODE END Error_Handler_Debug */
 }
-
 #ifdef USE_FULL_ASSERT
 /**
   * @brief  Reports the name of the source file and the source line number
