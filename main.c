@@ -234,13 +234,22 @@ int main(void)
   }
 
   // Initialize all 6 sensors
-  for(int i = 0; i < NUM_SENSORS; i++)
-  {
-      if(InitializeSensor(i, i) != 0)
-      {
-          Error_Handler();
-      }
-  }
+
+  //REINSTATE THIS INITIALIZATION
+//  for(int i = 0; i < NUM_SENSORS; i++)
+//  {
+//      if(InitializeSensor(i, i) != 0)
+//      {
+//          Error_Handler();
+//      }
+//  }
+  InitializeSensor(0,0);
+  InitializeSensor(1,1);
+  InitializeSensor(2,2);
+  InitializeSensor(3,3);
+  InitializeSensor(4,4);
+  InitializeSensor(5,5);
+
 
   /* USER CODE END 2 */
 
@@ -283,7 +292,6 @@ int main(void)
               any_ready = 1;
           }
       }
-
       if(any_ready)
       {
           DisplaySensorData();
