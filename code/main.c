@@ -21,10 +21,9 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
-#include "vl53l8cx_api.h"
+#include "../../Drivers/VL53L8CX_ULD_API/inc/vl53l8cx_api.h"
 #include <stdio.h>
-
+#include <stdbool.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -35,7 +34,22 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
+
 #define TCA9548A_ADDR 0x70
+#define NUM_SENSORS 6
+// #define DEMO_SENSOR 1  // Sensor 3 (index 2)
+
+/* DUAL_CORE_BOOT_SYNC_SEQUENCE: Define for dual core boot synchronization    */
+/*                             demonstration code based on hardware semaphore */
+/* This define is present in both CM7/CM4 projects                            */
+/* To comment when developping/debugging on a single core                     */
+//#define DUAL_CORE_BOOT_SYNC_SEQUENCE
+
+//#if defined(DUAL_CORE_BOOT_SYNC_SEQUENCE)
+//#ifndef HSEM_ID_0
+//#define HSEM_ID_0 (0U) /* HW semaphore 0*/
+//#endif
+//#endif /* DUAL_CORE_BOOT_SYNC_SEQUENCE */
 
 /* USER CODE END PD */
 
@@ -46,31 +60,166 @@
 
 /* Private variables ---------------------------------------------------------*/
 
-COM_InitTypeDef BspCOMInit;
-
 I2C_HandleTypeDef hi2c1;
 
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
 
-VL53L8CX_Configuration Dev;
-VL53L8CX_ResultsData Results;
+
+VL53L8CX_Configuration Dev_Sensors[NUM_SENSORS];
+VL53L8CX_ResultsData Results_Sensors[NUM_SENSORS];
+uint16_t sensor_min_distances[NUM_SENSORS] = {0};
 
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
-static void MPU_Config(void);
+void PeriphCommonClock_Config(void);
 static void MX_GPIO_Init(void);
-static void MX_USART1_UART_Init(void);
 static void MX_I2C1_Init(void);
+static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+int _write(int file, char *ptr, int len)
+{
+    HAL_UART_Transmit(&huart1, (uint8_t*)ptr, len, HAL_MAX_DELAY);
+    return len;
+}
+
+
+// Function to select multiplexer channel
+void SelectMuxChannel(uint8_t channel)
+{
+    uint8_t channel_byte = (1 << channel);
+    HAL_I2C_Master_Transmit(&hi2c1, TCA9548A_ADDR << 1, &channel_byte, 1, HAL_MAX_DELAY);
+    //HAL_Delay(10);
+}
+
+
+// Function to initialize a single sensor
+uint8_t InitializeSensor(uint8_t sensor_num, uint8_t channel)
+{
+    printf("--- Initializing Sensor %d (Channel %d) ---\r\n", sensor_num + 1, channel);
+
+    SelectMuxChannel(channel);
+
+    Dev_Sensors[sensor_num].platform.address = 0x52;
+
+    // Test I2C
+    HAL_StatusTypeDef i2c_result = HAL_I2C_IsDeviceReady(&hi2c1, 0x52, 3, 1000);
+    printf("Sensor %d I2C result: %d\r\n", sensor_num + 1, i2c_result);
+
+    if(i2c_result != HAL_OK)
+    {
+        printf("ERROR: Sensor %d not detected!\r\n", sensor_num + 1);
+        return 1;
+    }
+
+    // Check if alive
+    uint8_t isAlive, status;
+    status = vl53l8cx_is_alive(&Dev_Sensors[sensor_num], &isAlive);
+    printf("Sensor %d is_alive: status=%d, alive=%d\r\n", sensor_num + 1, status, isAlive);
+
+    if(status != 0 || !isAlive)
+    {
+        printf("ERROR: Sensor %d not alive!\r\n", sensor_num + 1);
+        return 1;
+    }
+
+    // Initialize sensor
+    printf("Initializing Sensor %d (takes ~5 seconds)...\r\n", sensor_num + 1);
+    status = vl53l8cx_init(&Dev_Sensors[sensor_num]);
+    printf("Sensor %d init status: %d\r\n", sensor_num + 1, status);
+
+    if(status != 0)
+    {
+        printf("ERROR: Sensor %d init failed!\r\n", sensor_num + 1);
+        return 1;
+    }
+
+    // Configure sensor
+    vl53l8cx_set_resolution(&Dev_Sensors[sensor_num], VL53L8CX_RESOLUTION_8X8);
+    vl53l8cx_set_ranging_frequency_hz(&Dev_Sensors[sensor_num], 15);
+    vl53l8cx_start_ranging(&Dev_Sensors[sensor_num]);
+
+    printf("OK - Sensor %d initialized and ranging!\r\n\r\n", sensor_num + 1);
+
+    return 0;
+}
+
+// Get color code and block character based on distance
+void GetDistanceDisplay(uint16_t dist_mm, char* color, char* block)
+{
+    if(dist_mm < 300) {
+        strcpy(color, "\033[41;97m");  // Red background, white text
+        strcpy(block, "██");
+    }
+    else if(dist_mm < 600) {
+        strcpy(color, "\033[31;1m");   // Bright red
+        strcpy(block, "▓▓");
+    }
+    else if(dist_mm < 1000) {
+        strcpy(color, "\033[33;1m");   // Bright yellow
+        strcpy(block, "▒▒");
+    }
+    else if(dist_mm < 2000) {
+        strcpy(color, "\033[32m");     // Green
+        strcpy(block, "░░");
+    }
+    else {
+        strcpy(color, "\033[36m");     // Cyan
+        strcpy(block, "··");
+    }
+}
+
+void ProcessSensorData(void)
+{
+    for(int i = 0; i < NUM_SENSORS; i++)
+    {
+        uint16_t min_distance = 0xFFFF;  // Start with max value
+
+        // Find minimum distance across all 64 zones (8x8)
+        for(int j = 0; j < 64; j++)
+        {
+            // Filter for valid targets (status 5 or 9)
+            if(Results_Sensors[i].target_status[j] == 5 ||
+               Results_Sensors[i].target_status[j] == 9)
+            {
+                if(Results_Sensors[i].distance_mm[j] < min_distance)
+                {
+                    min_distance = Results_Sensors[i].distance_mm[j];
+                }
+            }
+        }
+
+        // Store minimum distance for this sensor
+        sensor_min_distances[i] = min_distance;
+    }
+}
+
+// Send sensor data via UART to Raspberry Pi
+void SendSensorDataUART(void)
+{
+    char buffer[128];
+
+    // Format: sensor0,sensor1,sensor2,sensor3,sensor4,sensor5
+    sprintf(buffer, "%d,%d,%d,%d,%d,%d\r\n",
+            sensor_min_distances[0],
+            sensor_min_distances[1],
+            sensor_min_distances[2],
+            sensor_min_distances[3],
+            sensor_min_distances[4],
+            sensor_min_distances[5]);
+
+    HAL_UART_Transmit(&huart1, (uint8_t*)buffer, strlen(buffer), 100);
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -83,10 +232,23 @@ int main(void)
   /* USER CODE BEGIN 1 */
 
   /* USER CODE END 1 */
+/* USER CODE BEGIN Boot_Mode_Sequence_0 */
+#if defined(DUAL_CORE_BOOT_SYNC_SEQUENCE)
+  int32_t timeout;
+#endif /* DUAL_CORE_BOOT_SYNC_SEQUENCE */
+/* USER CODE END Boot_Mode_Sequence_0 */
 
-  /* MPU Configuration--------------------------------------------------------*/
-  MPU_Config();
-
+/* USER CODE BEGIN Boot_Mode_Sequence_1 */
+#if defined(DUAL_CORE_BOOT_SYNC_SEQUENCE)
+  /* Wait until CPU2 boots and enters in stop mode or timeout*/
+  timeout = 0xFFFF;
+  while((__HAL_RCC_GET_FLAG(RCC_FLAG_D2CKRDY) != RESET) && (timeout-- > 0));
+  if ( timeout < 0 )
+  {
+  Error_Handler();
+  }
+#endif /* DUAL_CORE_BOOT_SYNC_SEQUENCE */
+/* USER CODE END Boot_Mode_Sequence_1 */
   /* MCU Configuration--------------------------------------------------------*/
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
@@ -99,159 +261,102 @@ int main(void)
   /* Configure the system clock */
   SystemClock_Config();
 
+  /* Configure the peripherals common clocks */
+  PeriphCommonClock_Config();
+/* USER CODE BEGIN Boot_Mode_Sequence_2 */
+#if defined(DUAL_CORE_BOOT_SYNC_SEQUENCE)
+/* When system initialization is finished, Cortex-M7 will release Cortex-M4 by means of
+HSEM notification */
+/*HW semaphore Clock enable*/
+__HAL_RCC_HSEM_CLK_ENABLE();
+/*Take HSEM */
+HAL_HSEM_FastTake(HSEM_ID_0);
+/*Release HSEM in order to notify the CPU2(CM4)*/
+HAL_HSEM_Release(HSEM_ID_0,0);
+/* wait until CPU2 wakes up from stop mode */
+timeout = 0xFFFF;
+while((__HAL_RCC_GET_FLAG(RCC_FLAG_D2CKRDY) == RESET) && (timeout-- > 0));
+if ( timeout < 0 )
+{
+Error_Handler();
+}
+#endif /* DUAL_CORE_BOOT_SYNC_SEQUENCE */
+/* USER CODE END Boot_Mode_Sequence_2 */
+
   /* USER CODE BEGIN SysInit */
 
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_USART1_UART_Init();
   MX_I2C1_Init();
+  MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  /* Initialize COM1 port (115200, 8 bits (7-bit data + 1 stop bit), no parity */
-   BspCOMInit.BaudRate   = 115200;
-   BspCOMInit.WordLength = COM_WORDLENGTH_8B;
-   BspCOMInit.StopBits   = COM_STOPBITS_1;
-   BspCOMInit.Parity     = COM_PARITY_NONE;
-   BspCOMInit.HwFlowCtl  = COM_HWCONTROL_NONE;
-   if (BSP_COM_Init(COM1, &BspCOMInit) != BSP_ERROR_NONE)
-   {
-     Error_Handler();
-   }
 
-  printf("Starting VL53L8CX initialization...\r\n");
-  printf("Starting VL53L8CX init...\r\n");
+  HAL_GPIO_WritePin(GPIOF, GPIO_PIN_8, GPIO_PIN_SET);  // PWR_EN high
+  HAL_Delay(10);
 
-  // Proper boot sequence
-
-  // Enable power regulators first
-  HAL_GPIO_WritePin(PWR_EN_GPIO_Port, PWR_EN_Pin, GPIO_PIN_SET);
-  HAL_Delay(10);  // Wait for regulators to stabilize
-
-  HAL_GPIO_WritePin(VL53L8_LPn_GPIO_Port, VL53L8_LPn_Pin, GPIO_PIN_RESET);  // Start LOW
+  HAL_GPIO_WritePin(GPIOJ, GPIO_PIN_4, GPIO_PIN_RESET);  // LPn low
   HAL_Delay(100);
-  HAL_GPIO_WritePin(VL53L8_LPn_GPIO_Port, VL53L8_LPn_Pin, GPIO_PIN_SET);    // Set HIGH
-  HAL_Delay(100);  // Wait for sensor to boot
+  HAL_GPIO_WritePin(GPIOJ, GPIO_PIN_4, GPIO_PIN_SET);    // LPn high
+  HAL_Delay(100);
 
-
-  // TEST: Check if multiplexer responds
-  printf("Testing multiplexer at 0x70...\r\n");
-  HAL_StatusTypeDef mux_result = HAL_I2C_IsDeviceReady(&hi2c1, 0x70 << 1, 3, 1000);
-  printf("Multiplexer result: %d\r\n", mux_result);
+  // Test multiplexer
+  HAL_StatusTypeDef mux_result = HAL_I2C_IsDeviceReady(&hi2c1, TCA9548A_ADDR << 1, 3, 1000);
 
   if(mux_result != HAL_OK)
   {
-      printf("ERROR: Multiplexer not detected!\r\n");
       Error_Handler();
   }
 
-  // Select channel 0 on multiplexer
-  printf("Selecting multiplexer channel 0...\r\n");
-  uint8_t channel = 0x01;  // Enable channel 0
-  HAL_I2C_Master_Transmit(&hi2c1, 0x70 << 1, &channel, 1, HAL_MAX_DELAY);
-
-  // NOW talk to the sensor at 0x52
-  Dev.platform.address = 0x52;
-
-  HAL_StatusTypeDef i2c_result;
-  i2c_result = HAL_I2C_IsDeviceReady(&hi2c1, 0x52, 3, 1000);
-  printf("Sensor (through mux) result: %d\r\n", i2c_result);
-
-  if(i2c_result != HAL_OK)
+  // Initialize all 6 sensors
+  for(int i = 0; i < NUM_SENSORS; i++)
   {
-      printf("ERROR: Sensor not detected on channel 0!\r\n");
-      Error_Handler();
+      if(InitializeSensor(i, i) != 0)
+      {
+          Error_Handler();
+      }
   }
 
-  printf("SUCCESS: Sensor detected through multiplexer!\r\n");
-
-  // Check if alive
-  uint8_t isAlive, status;
-  status = vl53l8cx_is_alive(&Dev, &isAlive);
-  printf("is_alive status: %d, isAlive: %d\r\n", status, isAlive);
-  if(status != 0 || !isAlive)
-  {
-      Error_Handler();  // Sensor not responding
-  }
-
-  // Initialize (uploads firmware)
-  printf("Starting init - this takes 1-2 seconds...\r\n");
-  HAL_UART_Transmit(&hcom_uart[COM1], (uint8_t*)"ASD", 20, HAL_MAX_DELAY);
-  fflush(stdout);  // Force output
-  status = vl53l8cx_init(&Dev);  // Takes around 5seconds to initialize
-  printf("Init returned status: %d\r\n", status);
-  fflush(stdout);  // Force output
-  if(status != 0)
-  {
-	  printf("Init FAILED with status: %d\r\n", status);
-      Error_Handler();  // Init failed
-  }
-
-  printf("Init SUCCESS!\r\n");
-
-  // Configure
-  status = vl53l8cx_set_resolution(&Dev, VL53L8CX_RESOLUTION_8X8);
-  if(status != VL53L8CX_STATUS_OK)
-  {
-	  HAL_UART_Transmit(&hcom_uart[COM1], (uint8_t*)"Resolution not OK\r\n", 20, HAL_MAX_DELAY);
-  }
-
-
-  status = vl53l8cx_set_ranging_frequency_hz(&Dev, 15);
-  if(status != VL53L8CX_STATUS_OK)
-  {
-	  HAL_UART_Transmit(&hcom_uart[COM1], (uint8_t*)"Frequency not OK\r\n", 20, HAL_MAX_DELAY);
-  }
-
-
-
-  // Start ranging
-  vl53l8cx_start_ranging(&Dev);
 
   /* USER CODE END 2 */
-
-  /* Initialize leds */
-  BSP_LED_Init(LED_GREEN);
-  BSP_LED_Init(LED_YELLOW);
-  BSP_LED_Init(LED_RED);
-
-  /* Initialize USER push-button, will be used to trigger an interrupt each time it's pressed.*/
-  BSP_PB_Init(BUTTON_USER, BUTTON_MODE_EXTI);
 
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  while (1)
-  {
+	  while (1)
+	  {
+	      bool any_updated = false;
 
-	uint8_t isReady;
-	vl53l8cx_check_data_ready(&Dev, &isReady);
+	      // Quick check all sensors
+	      for(int i = 0; i < NUM_SENSORS; i++)
+	      {
+	          uint8_t isReady;
+	          SelectMuxChannel(i);
 
-	if(isReady)
-	{
-	    vl53l8cx_get_ranging_data(&Dev, &Results);
+	          vl53l8cx_check_data_ready(&Dev_Sensors[i], &isReady);
 
-	    printf("\r\n=== Distance Map (8x8) ===\r\n");
-	    for(int row = 0; row < 8; row++)
-	    {
-	        for(int col = 0; col < 8; col++)
-	        {
-	            int zone = row * 8 + col;
-	            printf("%4d ", Results.distance_mm[zone]);
-	        }
-	        printf("\r\n");
-	    }
-//	    printf("\r\n");
-	}
+	          if(isReady)
+	          {
+	              vl53l8cx_get_ranging_data(&Dev_Sensors[i], &Results_Sensors[i]);
+	              any_updated = true;
+	          }
+	      }
 
-	HAL_Delay(500);
+	      // Only process and send if at least one sensor updated
+	      if(any_updated)
+	      {
+	          ProcessSensorData();
+	          SendSensorDataUART();
+	      }
 
+	      // No delay - let it run as fast as possible
+	  }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
-}
 
 /**
   * @brief System Clock Configuration
@@ -264,28 +369,31 @@ void SystemClock_Config(void)
 
   /** Supply configuration update enable
   */
-  HAL_PWREx_ConfigSupply(PWR_LDO_SUPPLY);
+  HAL_PWREx_ConfigSupply(PWR_DIRECT_SMPS_SUPPLY);
 
   /** Configure the main internal regulator output voltage
   */
-  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE2);
+  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
 
   while(!__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY)) {}
 
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI|RCC_OSCILLATORTYPE_LSI
+                              |RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.HSIState = RCC_HSI_DIV1;
-  RCC_OscInitStruct.HSICalibrationValue = 64;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.LSIState = RCC_LSI_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
-  RCC_OscInitStruct.PLL.PLLM = 4;
-  RCC_OscInitStruct.PLL.PLLN = 12;
-  RCC_OscInitStruct.PLL.PLLP = 1;
-  RCC_OscInitStruct.PLL.PLLQ = 4;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = 5;
+  RCC_OscInitStruct.PLL.PLLN = 48;
+  RCC_OscInitStruct.PLL.PLLP = 2;
+  RCC_OscInitStruct.PLL.PLLQ = 5;
   RCC_OscInitStruct.PLL.PLLR = 2;
-  RCC_OscInitStruct.PLL.PLLRGE = RCC_PLL1VCIRANGE_3;
+  RCC_OscInitStruct.PLL.PLLRGE = RCC_PLL1VCIRANGE_2;
   RCC_OscInitStruct.PLL.PLLVCOSEL = RCC_PLL1VCOWIDE;
   RCC_OscInitStruct.PLL.PLLFRACN = 0;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
@@ -298,15 +406,42 @@ void SystemClock_Config(void)
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2
                               |RCC_CLOCKTYPE_D3PCLK1|RCC_CLOCKTYPE_D1PCLK1;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_HSI;
   RCC_ClkInitStruct.SYSCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.AHBCLKDivider = RCC_HCLK_DIV2;
-  RCC_ClkInitStruct.APB3CLKDivider = RCC_APB3_DIV2;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_APB1_DIV2;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_APB2_DIV2;
-  RCC_ClkInitStruct.APB4CLKDivider = RCC_APB4_DIV2;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_HCLK_DIV1;
+  RCC_ClkInitStruct.APB3CLKDivider = RCC_APB3_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_APB1_DIV1;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_APB2_DIV1;
+  RCC_ClkInitStruct.APB4CLKDivider = RCC_APB4_DIV1;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_1) != HAL_OK)
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  HAL_RCC_MCOConfig(RCC_MCO1, RCC_MCO1SOURCE_HSI, RCC_MCODIV_1);
+}
+
+/**
+  * @brief Peripherals Common Clock Configuration
+  * @retval None
+  */
+void PeriphCommonClock_Config(void)
+{
+  RCC_PeriphCLKInitTypeDef PeriphClkInitStruct = {0};
+
+  /** Initializes the peripherals clock
+  */
+  PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_ADC;
+  PeriphClkInitStruct.PLL2.PLL2M = 2;
+  PeriphClkInitStruct.PLL2.PLL2N = 12;
+  PeriphClkInitStruct.PLL2.PLL2P = 2;
+  PeriphClkInitStruct.PLL2.PLL2Q = 2;
+  PeriphClkInitStruct.PLL2.PLL2R = 2;
+  PeriphClkInitStruct.PLL2.PLL2RGE = RCC_PLL2VCIRANGE_3;
+  PeriphClkInitStruct.PLL2.PLL2VCOSEL = RCC_PLL2VCOMEDIUM;
+  PeriphClkInitStruct.PLL2.PLL2FRACN = 0;
+  PeriphClkInitStruct.AdcClockSelection = RCC_ADCCLKSOURCE_PLL2;
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK)
   {
     Error_Handler();
   }
@@ -328,7 +463,7 @@ static void MX_I2C1_Init(void)
 
   /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
-  hi2c1.Init.Timing = 0x20303E5D;
+  hi2c1.Init.Timing = 0x00602173;
   hi2c1.Init.OwnAddress1 = 0;
   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
   hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
@@ -422,33 +557,42 @@ static void MX_GPIO_Init(void)
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOC_CLK_ENABLE();
-  __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOH_CLK_ENABLE();
 
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOC, VL53L8_LPn_Pin|GPIO_PIN_3, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(PWR_EN_GPIO_Port, PWR_EN_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pins : VL53L8_LPn_Pin PC3 */
-  GPIO_InitStruct.Pin = VL53L8_LPn_Pin|GPIO_PIN_3;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  /*Configure GPIO pin : CEC_CK_MCO1_Pin */
+  GPIO_InitStruct.Pin = CEC_CK_MCO1_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : PWR_EN_Pin */
-  GPIO_InitStruct.Pin = PWR_EN_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(PWR_EN_GPIO_Port, &GPIO_InitStruct);
-
-  /*AnalogSwitch Config */
-  HAL_SYSCFG_AnalogSwitchConfig(SYSCFG_SWITCH_PC3, SYSCFG_SWITCH_PC3_CLOSE);
+  GPIO_InitStruct.Alternate = GPIO_AF0_MCO;
+  HAL_GPIO_Init(CEC_CK_MCO1_GPIO_Port, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+
+  /* USER CODE BEGIN MX_GPIO_Init_2 */
+
+  /* Enable clocks */
+  __HAL_RCC_GPIOJ_CLK_ENABLE();
+  __HAL_RCC_GPIOF_CLK_ENABLE();
+
+  /* Configure LPn (PJ4) */
+  HAL_GPIO_WritePin(GPIOJ, GPIO_PIN_4, GPIO_PIN_RESET);
+  GPIO_InitStruct.Pin = GPIO_PIN_4;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOJ, &GPIO_InitStruct);
+
+  /* Configure PWR (PF8) */
+  HAL_GPIO_WritePin(GPIOF, GPIO_PIN_8, GPIO_PIN_RESET);
+  GPIO_InitStruct.Pin = GPIO_PIN_8;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOF, &GPIO_InitStruct);
 
   /* USER CODE END MX_GPIO_Init_2 */
 }
@@ -456,35 +600,6 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 
 /* USER CODE END 4 */
-
- /* MPU Configuration */
-
-void MPU_Config(void)
-{
-  MPU_Region_InitTypeDef MPU_InitStruct = {0};
-
-  /* Disables the MPU */
-  HAL_MPU_Disable();
-
-  /** Initializes and configures the Region and the memory to be protected
-  */
-  MPU_InitStruct.Enable = MPU_REGION_ENABLE;
-  MPU_InitStruct.Number = MPU_REGION_NUMBER0;
-  MPU_InitStruct.BaseAddress = 0x0;
-  MPU_InitStruct.Size = MPU_REGION_SIZE_4GB;
-  MPU_InitStruct.SubRegionDisable = 0x87;
-  MPU_InitStruct.TypeExtField = MPU_TEX_LEVEL0;
-  MPU_InitStruct.AccessPermission = MPU_REGION_NO_ACCESS;
-  MPU_InitStruct.DisableExec = MPU_INSTRUCTION_ACCESS_DISABLE;
-  MPU_InitStruct.IsShareable = MPU_ACCESS_SHAREABLE;
-  MPU_InitStruct.IsCacheable = MPU_ACCESS_NOT_CACHEABLE;
-  MPU_InitStruct.IsBufferable = MPU_ACCESS_NOT_BUFFERABLE;
-
-  HAL_MPU_ConfigRegion(&MPU_InitStruct);
-  /* Enables the MPU */
-  HAL_MPU_Enable(MPU_PRIVILEGED_DEFAULT);
-
-}
 
 /**
   * @brief  This function is executed in case of error occurrence.
